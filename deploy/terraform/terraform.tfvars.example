@@ -1,0 +1,10 @@
+# Variables for Real AWS Deployment (Production)
+aws_region          = "us-east-1"
+environment         = "production"
+bucket_name         = "respondio-video-metadata-archive-prod-unique"
+floci_endpoint      = "" # Blank for real AWS
+vpc_cidr            = "10.0.0.0/16"
+private_subnet_1_cidr = "10.0.1.0/24"
+private_subnet_2_cidr = "10.0.2.0/24"
+lambda_memory_size  = 512
+lambda_timeout      = 60
