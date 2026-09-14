@@ -1,0 +1,219 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  respond.io Senior DevOps Assessment: S3 Video Metadata Archive Automation.
+  Provisions custom VPC, multi-AZ private subnets, S3 Gateway Endpoint,
+  S3 Bucket, and a Dockerized AWS Lambda with versioning and rollbacks.
+
+Parameters:
+  Environment:
+    Type: String
+    Default: production
+    AllowedValues: [development, staging, production]
+    Description: Deployment target environment.
+  VpcCidr:
+    Type: String
+    Default: 10.0.0.0/16
+    Description: CIDR block for the custom VPC.
+  PrivateSubnet1Cidr:
+    Type: String
+    Default: 10.0.1.0/24
+    Description: CIDR block for Private Subnet 1 (AZ A).
+  PrivateSubnet2Cidr:
+    Type: String
+    Default: 10.0.2.0/24
+    Description: CIDR block for Private Subnet 2 (AZ B).
+
+Resources:
+  # ===========================================================================
+  # 1. NETWORKING: Custom VPC & Private Subnets (Task 2 Requirement)
+  # ===========================================================================
+  CustomVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub respondio-video-archive-vpc-${Environment}
+        - Key: ManagedBy
+          Value: AWS-SAM
+
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref CustomVPC
+      CidrBlock: !Ref PrivateSubnet1Cidr
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub respondio-private-subnet-1-${Environment}
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref CustomVPC
+      CidrBlock: !Ref PrivateSubnet2Cidr
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub respondio-private-subnet-2-${Environment}
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref CustomVPC
+      Tags:
+        - Key: Name
+          Value: !Sub respondio-private-rt-${Environment}
+
+  Subnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet1
+      RouteTableId: !Ref PrivateRouteTable
+
+  Subnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet2
+      RouteTableId: !Ref PrivateRouteTable
+
+  # ===========================================================================
+  # 2. S3 GATEWAY ENDPOINT (Zero NAT data costs for 7.3 PB/month traffic!)
+  # ===========================================================================
+  S3VpcEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref CustomVPC
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.s3
+      VpcEndpointType: Gateway
+      RouteTableIds:
+        - !Ref PrivateRouteTable
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action:
+              - 's3:GetObject'
+              - 's3:PutObject'
+              - 's3:DeleteObject'
+              - 's3:ListBucket'
+            Resource: '*'
+
+  # ===========================================================================
+  # 3. SECURITY GROUP: Lambda egress in Private Subnets
+  # ===========================================================================
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for Video Metadata Archiver Lambda in private subnets
+      VpcId: !Ref CustomVPC
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: Allow outbound traffic to S3 VPC Endpoint
+      Tags:
+        - Key: Name
+          Value: !Sub respondio-lambda-sg-${Environment}
+
+  # ===========================================================================
+  # 4. S3 STORAGE BUCKET (Task 2 Requirement)
+  # ===========================================================================
+  VideoMetadataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: video-processing-metadata-archive
+
+  # ===========================================================================
+  # 5. DOCKERIZED LAMBDA WITH VERSIONING (Tasks 1 & 2 Requirements)
+  # ===========================================================================
+  VideoArchiverFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      PackageType: Image
+      MemorySize: 512
+      Timeout: 60
+      # AutoPublishAlias creates an immutable version on every deploy for rollbacks
+      AutoPublishAlias: live
+      DeploymentPreference:
+        Type: AllAtOnce
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - !Ref PrivateSubnet1
+          - !Ref PrivateSubnet2
+      Policies:
+        # Standard VPC execution permissions for ENI creation
+        - AWSLambdaVPCAccessExecutionRole
+        # Least privilege S3 permissions
+        - Statement:
+            - Effect: Allow
+              Action:
+                - s3:GetObject
+                - s3:PutObject
+                - s3:DeleteObject
+              Resource: !Sub ${VideoMetadataBucket.Arn}/*
+            - Effect: Allow
+              Action:
+                - s3:ListBucket
+              Resource: !Sub ${VideoMetadataBucket.Arn}
+      Events:
+        # Triggered only when a new .json file is uploaded (avoids recursion on .zip)
+        NewMetadataUpload:
+          Type: S3
+          Properties:
+            Bucket: !Ref VideoMetadataBucket
+            Events: s3:ObjectCreated:*
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: suffix
+                    Value: .json
+    Metadata:
+      DockerTag: python3.12-v1
+      DockerContext: ./lambda
+      Dockerfile: Dockerfile
+
+Outputs:
+  VpcId:
+    Description: Custom VPC ID
+    Value: !Ref CustomVPC
+  PrivateSubnet1Id:
+    Description: Private Subnet 1 (AZ A)
+    Value: !Ref PrivateSubnet1
+  PrivateSubnet2Id:
+    Description: Private Subnet 2 (AZ B)
+    Value: !Ref PrivateSubnet2
+  S3BucketName:
+    Description: Video Metadata S3 Bucket
+    Value: !Ref VideoMetadataBucket
+    Export:
+      Name: !Sub ${AWS::StackName}-BucketName
+  LambdaFunctionArn:
+    Description: Lambda Function ARN
+    Value: !GetAtt VideoArchiverFunction.Arn
+  LambdaLiveAliasArn:
+    Description: Lambda Function Live Alias ARN (Immutable Release Target)
+    Value: !Ref VideoArchiverFunction.Alias
+
