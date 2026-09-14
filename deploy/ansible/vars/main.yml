@@ -1,0 +1,10 @@
+---
+environment_target: "floci" # 'floci' or 'aws'
+floci_endpoint: "http://localhost:4566"
+aws_region: "us-east-1"
+s3_bucket: "respondio-video-metadata-archive-local"
+docker_image_name: "respondio-video-archiver:latest"
+test_file_name: "video_metadata_sample.json"
+test_file_size_mb: 10
+terraform_dir: "../terraform"
+lambda_dir: "../../lambda"

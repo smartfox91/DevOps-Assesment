@@ -1,0 +1,59 @@
+---
+- name: respond.io DevOps Assessment Automation Playbook
+  hosts: local
+  gather_facts: true
+  vars_files:
+    - vars/main.yml
+
+  tasks:
+    - name: 1. Verify Floci emulator endpoint availability
+      ansible.builtin.uri:
+        url: "{{ floci_endpoint }}/_floci/health"
+        method: GET
+        status_code: 200
+      register: floci_health
+      retries: 3
+      delay: 5
+      until: floci_health.status == 200
+      when: environment_target == "floci"
+
+    - name: 2. Display Floci health status
+      ansible.builtin.debug:
+        msg: "Floci emulator is healthy at {{ floci_endpoint }}"
+      when: environment_target == "floci"
+
+    - name: 3. Build Docker container image for Lambda (Task 2 Requirement)
+      ansible.builtin.command:
+        cmd: "docker build -t {{ docker_image_name }} {{ lambda_dir }}"
+      register: docker_build_result
+      changed_when: true
+
+    - name: 4. Initialize Terraform working directory
+      ansible.builtin.command:
+        cmd: "terraform -chdir={{ terraform_dir }} init -upgrade"
+      register: tf_init
+      changed_when: false
+
+    - name: 5. Plan and validate Terraform resources
+      ansible.builtin.command:
+        cmd: "terraform -chdir={{ terraform_dir }} plan -var-file=floci.tfvars"
+      register: tf_plan
+      changed_when: false
+      when: environment_target == "floci"
+
+    - name: 6. Apply Terraform infrastructure
+      ansible.builtin.command:
+        cmd: "terraform -chdir={{ terraform_dir }} apply -auto-approve -var-file=floci.tfvars"
+      register: tf_apply
+      changed_when: true
+      when: environment_target == "floci"
+
+    - name: 7. Run end-to-end verification test suite
+      ansible.builtin.command:
+        cmd: "python ../../scripts/verify_floci.py"
+      register: test_suite
+      changed_when: false
+
+    - name: 8. Report verification results
+      ansible.builtin.debug:
+        msg: "{{ test_suite.stdout_lines }}"
